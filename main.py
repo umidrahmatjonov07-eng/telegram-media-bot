@@ -188,7 +188,8 @@ async def search_track(query: str, limit: int = 5) -> List[Dict[str, Any]]:
 
 async def recognize_audio(file_path: str) -> Optional[Dict[str, Any]]:
     try:
-        out = await shazam.recognize(file_path)
+        audio_bytes = Path(file_path).read_bytes()
+        out = await shazam.recognize(audio_bytes)
         track = out.get("track")
         if not track: return None
         return {"title": track.get("title"), "subtitle": track.get("subtitle")}
@@ -240,7 +241,13 @@ def _download_video_sync(url: str, output_template: str) -> Optional[Dict[str, A
             if not filepath.endswith('.mp4'):
                 base, _ = os.path.splitext(filepath)
                 if os.path.exists(base + '.mp4'): filepath = base + '.mp4'
-            return {'filepath': filepath, 'title': info.get('title', 'Video'), 'description': info.get('description', '')}
+            return {
+                'filepath': filepath,
+                'title': info.get('title', 'Video'),
+                'description': info.get('description', ''),
+                'track': info.get('track'),
+                'artist': info.get('artist')
+            }
     except Exception as e:
         print(f"Video yuklashda xatolik: {e}")
         return None
@@ -250,24 +257,20 @@ async def download_video_fast(url: str) -> Optional[Dict[str, Any]]:
     output_tmpl = str(DOWNLOAD_DIR / f"vid_{unique_id}.%(ext)s")
     return await asyncio.to_thread(_download_video_sync, url, output_tmpl)
 
-def extract_audio_sample_for_shazam(video_path: str, output_path: str, start_time: int = 0, duration: int = 25) -> bool:
+def extract_audio_sample_for_shazam(video_path: str, output_path: str, start_time: int = 0, duration: int = 0) -> bool:
     """
     Shazam uchun toza WAV (16-bit 44100Hz mono) namuna ajratib olish
     WAV formati hech qachon SignatureError bermaydi va 100% aniqlanadi!
     """
     try:
-        cmd = [
-            FFMPEG_EXE, '-y',
-            '-ss', str(start_time),
-            '-i', video_path,
-            '-t', str(duration),
-            '-vn',
-            '-ar', '44100',
-            '-ac', '1',
-            '-f', 'wav',
-            output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=20)
+        cmd = [FFMPEG_EXE, '-y']
+        if start_time > 0:
+            cmd.extend(['-ss', str(start_time)])
+        cmd.extend(['-i', video_path])
+        if duration > 0:
+            cmd.extend(['-t', str(duration)])
+        cmd.extend(['-vn', '-ar', '44100', '-ac', '1', '-f', 'wav', output_path])
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=25)
         return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
     except Exception as e:
         print(f"Sample extraction error: {e}")
@@ -275,37 +278,27 @@ def extract_audio_sample_for_shazam(video_path: str, output_path: str, start_tim
 
 async def recognize_music_from_video(video_path: str) -> Optional[Dict[str, Any]]:
     """
-    Videodagi musiqani 3 bosqichli aqlli Shazam orqali aniqlash
+    Videodagi musiqani Shazam orqali aniqlash
     """
-    # 1-urinish: Dastlabki 25 soniya (0 - 25s)
-    tmp1 = str(DOWNLOAD_DIR / f"samp1_{uuid.uuid4().hex[:8]}.wav")
+    # 1-urinish: Videoning TO'LIQ audiosi (WAV). 15-30s Reels uchun butun audioni tekshirish eng to'g'ri usul!
+    tmp1 = str(DOWNLOAD_DIR / f"samp_full_{uuid.uuid4().hex[:8]}.wav")
     try:
-        if extract_audio_sample_for_shazam(video_path, tmp1, start_time=0, duration=25):
+        if extract_audio_sample_for_shazam(video_path, tmp1, start_time=0, duration=0):
             res = await recognize_audio(tmp1)
             if res and res.get('title'):
                 return res
     finally:
         remove_file(tmp1)
 
-    # 2-urinish: O'rtasidagi 25 soniya (12 - 37s) (agar boshida odam gapirgan bo'lsa)
-    tmp2 = str(DOWNLOAD_DIR / f"samp2_{uuid.uuid4().hex[:8]}.wav")
+    # 2-urinish: 6-soniyadan keyingi qism (agar boshida odam gapirgan bo'lsa)
+    tmp2 = str(DOWNLOAD_DIR / f"samp_mid_{uuid.uuid4().hex[:8]}.wav")
     try:
-        if extract_audio_sample_for_shazam(video_path, tmp2, start_time=12, duration=25):
+        if extract_audio_sample_for_shazam(video_path, tmp2, start_time=6, duration=25):
             res = await recognize_audio(tmp2)
             if res and res.get('title'):
                 return res
     finally:
         remove_file(tmp2)
-
-    # 3-urinish: Keyingi 25 soniya (25 - 50s)
-    tmp3 = str(DOWNLOAD_DIR / f"samp3_{uuid.uuid4().hex[:8]}.wav")
-    try:
-        if extract_audio_sample_for_shazam(video_path, tmp3, start_time=25, duration=25):
-            res = await recognize_audio(tmp3)
-            if res and res.get('title'):
-                return res
-    finally:
-        remove_file(tmp3)
 
     return None
 
@@ -319,22 +312,28 @@ def _download_full_song_sync(query: str, output_template: str) -> Optional[Dict[
 
     try:
         with yt_dlp.YoutubeDL(search_opts) as ydl:
-            res = ydl.extract_info(f"ytsearch5:{query} official audio", download=False)
+            # 1. To'g'ridan-to'g'ri so'rov orqali YouTube'dan to'liq qo'shiqni qidirish
+            res = ydl.extract_info(f"ytsearch5:{query}", download=False)
             entries = res.get('entries', []) if res else []
+            # 90 soniyadan 600 soniyagacha bo'lgan to'liq original musiqani tanlaymiz
             for e in entries:
                 dur = e.get('duration') or 0
-                if 120 <= dur <= 600:
+                if 90 <= dur <= 600:
                     selected_url = e.get('url')
                     selected_title = e.get('title') or query
                     break
             if not selected_url and entries:
-                selected_url = entries[0].get('url')
-                selected_title = entries[0].get('title') or query
-    except Exception:
-        pass
+                for e in entries:
+                    dur = e.get('duration') or 0
+                    if dur >= 60:
+                        selected_url = e.get('url')
+                        selected_title = e.get('title') or query
+                        break
+    except Exception as e:
+        print(f"YouTube search error: {e}")
 
     if not selected_url:
-        selected_url = f"ytsearch1:{query} audio"
+        return None
 
     dl_opts = _get_fast_opts()
     dl_opts.update({'format': 'bestaudio[ext=m4a]/bestaudio/best', 'outtmpl': output_template})
@@ -586,17 +585,32 @@ async def handle_url_message(message: types.Message, bot: Bot):
 
     media_id = uuid.uuid4().hex[:10]
 
-    # Videodan audioni darhol ajratib olamiz (0.01 soniya oladi va har doim kafolatlangan audio bo'ladi!)
+    # Videodan audioni darhol ajratib olamiz (0.01 soniya, kafolatlangan zaxira)
     direct_audio_base = str(DOWNLOAD_DIR / f"aud_{media_id}")
     direct_audio_path = extract_direct_audio_from_video(filepath, direct_audio_base)
 
-    # WAV orqali Shazam tahlili (100% xatosiz va tez)
-    recognized_song = await recognize_music_from_video(filepath)
+    song_title = ""
+    artist = ""
+    is_shazam = False
 
-    if recognized_song and recognized_song.get('title'):
-        song_title = recognized_song['title']
-        artist = recognized_song.get('subtitle', '')
-        search_query = f"{song_title} {artist}"
+    # 1. Instagram / TikTok metama'lumotlaridan tekshirish
+    meta_track = res.get('track')
+    meta_artist = res.get('artist')
+    if meta_track and len(meta_track.strip()) > 1:
+        song_title = meta_track.strip()
+        artist = (meta_artist or "").strip()
+        is_shazam = True
+
+    # 2. Agar metama'lumotda bo'lmasa, butun audio WAV orqali Shazam tahlili
+    if not is_shazam:
+        recognized_song = await recognize_music_from_video(filepath)
+        if recognized_song and recognized_song.get('title'):
+            song_title = recognized_song['title'].strip()
+            artist = (recognized_song.get('subtitle') or "").strip()
+            is_shazam = True
+
+    if is_shazam and song_title:
+        search_query = f"{song_title} {artist}".strip()
         btn_text = f"🎵 {song_title[:24]} (To'liq MP3)"
         caption = (
             f"🎬 <b>{title[:75]}</b>\n\n"
@@ -604,17 +618,24 @@ async def handle_url_message(message: types.Message, bot: Bot):
             f"✨ <i>To'liq (original 3-5 daqiqalik) variantini yuklash uchun pastdagi tugmani bosing 👇</i>\n\n"
             f"✅ @top_media_uz_bot"
         )
-        is_shazam = True
     else:
-        search_query = title
-        btn_text = "🎵 Videodagi audioni yuklab olish"
-        caption = f"🎬 <b>{title[:100]}</b>\n\n✅ <i>Yuklab beruvchi:</i> @top_media_uz_bot"
-        is_shazam = False
+        # Sarlavhadan xeshteg va keraksiz so'zlarni tozalab qidiruv so'rovi yasash
+        clean_t = re.sub(r'#\w+|https?:\/\/\S+|Video by \S+|[@_]', ' ', desc or title).strip()
+        clean_t = re.sub(r'\s+', ' ', clean_t).strip()
+        search_query = clean_t if len(clean_t) > 3 else title
+        song_title = search_query[:35]
+        btn_text = "🎵 To'liq MP3 musiqani yuklab olish"
+        caption = (
+            f"🎬 <b>{title[:75]}</b>\n\n"
+            f"✨ <i>To'liq (original 3-5 daqiqalik) variantini yuklash uchun pastdagi tugmani bosing 👇</i>\n\n"
+            f"✅ @top_media_uz_bot"
+        )
 
     media_store[media_id] = {
         'query': search_query,
         'url': url,
-        'title': song_title if is_shazam else title,
+        'title': song_title,
+        'artist': artist,
         'is_shazam': is_shazam,
         'direct_audio': direct_audio_path,
     }
@@ -662,15 +683,14 @@ async def handle_video_file_recognition(message: types.Message, bot: Bot):
                 f"🎉 <b>Musiqa topildi!</b>\n\n"
                 f"🎵 <b>Nomi:</b> {song_title}\n"
                 f"👤 <b>Ijrochi:</b> {artist}\n\n"
-                f"<i>To'liq (original) musiqani yuklab olish uchun pastdagi tugmani bosing 👇</i>"
+                f"<i>To'liq (original 3-5 daqiqalik) musiqani yuklab olish uchun pastdagi tugmani bosing 👇</i>"
             )
             await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=markup)
         elif direct_audio_path and os.path.exists(direct_audio_path):
-            # Shazamda topilmasa, videoning o'zidagi audioni darhol yuboramiz
             await message.reply_audio(
                 audio=FSInputFile(direct_audio_path),
                 title="Videodagi audio",
-                caption="🎵 <b>Videodagi audio yuklandi!</b>\n💡 <i>(Shazam bazasidan topilmadi, lekin videoning o'zidagi ovoz ajratib berildi)</i>\n\n✅ @top_media_uz_bot",
+                caption="🎵 <b>Videodagi audio yuklandi!</b>\n💡 <i>(Shazam bazasidan topilmadi, videoning o'zidagi ovoz ajratib berildi)</i>\n\n✅ @top_media_uz_bot",
                 parse_mode="HTML"
             )
             await status_msg.delete()
@@ -691,27 +711,26 @@ async def on_get_media_audio(callback: CallbackQuery, bot: Bot):
         await callback.answer("⚠️ Ma'lumot eskirgan, linkni qayta tashlang.", show_alert=True)
         return
 
-    await callback.answer("⏳ Musiqa tayyorlanmoqda...")
-    status_msg = await callback.message.reply("⏳ <i>Musiqa tayyorlanmoqda, kuting...</i>", parse_mode="HTML")
+    await callback.answer("⏳ To'liq musiqa qidirilmoqda...")
+    status_msg = await callback.message.reply("⏳ <i>To'liq (original 3-5 daqiqalik) musiqa tayyorlanmoqda, kuting...</i>", parse_mode="HTML")
     await bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE)
 
     query = data.get('query', '')
     url = data.get('url', '')
     song_title = data.get('title', 'Musiqa')
-    is_shazam = data.get('is_shazam', False)
     direct_audio = data.get('direct_audio')
 
     sent = False
 
-    # 1. Agar Shazam qo'shiqni aniqlagan bo'lsa, YouTube'dan to'liq variantini qidiramiz
-    if is_shazam and query:
+    # 1. BIRINCHI BO'LIB HAR DOIM YOUTUBE'DAN TO'LIQ (3-5 DAQIQALIK) ORIGINAL QO'SHIQNI QIDIRAMIZ!
+    if query:
         cache_key = query.strip().lower()
         cached_id = audio_file_cache.get(cache_key)
         if cached_id:
             await callback.message.answer_audio(
                 audio=cached_id,
-                title=query,
-                caption=f"🎵 <b>{query}</b>\n✨ <i>To'liq (original) musiqa!</i>\n✅ @top_media_uz_bot",
+                title=song_title,
+                caption=f"🎵 <b>{song_title}</b>\n✨ <i>To'liq (original) musiqa!</i>\n✅ @top_media_uz_bot",
                 parse_mode="HTML"
             )
             await status_msg.delete()
@@ -720,12 +739,12 @@ async def on_get_media_audio(callback: CallbackQuery, bot: Bot):
         full_res = await download_full_song_by_query(query)
         if full_res and os.path.exists(full_res.get('filepath', '')):
             fpath = full_res['filepath']
-            stitle = full_res.get('title', query)
+            stitle = full_res.get('title', song_title)
             try:
                 sent_msg = await callback.message.answer_audio(
                     audio=FSInputFile(fpath),
                     title=stitle,
-                    caption=f"🎵 <b>{stitle}</b>\n✨ <i>Videodagi musiqa to'liq (original) varianti yuklandi!</i>\n✅ @top_media_uz_bot",
+                    caption=f"🎵 <b>{stitle}</b>\n✨ <i>To'liq (original 3-5 daqiqalik) varianti yuklandi!</i>\n✅ @top_media_uz_bot",
                     parse_mode="HTML"
                 )
                 if sent_msg.audio:
@@ -735,28 +754,48 @@ async def on_get_media_audio(callback: CallbackQuery, bot: Bot):
             finally:
                 remove_file(fpath)
 
-    # 2. Agar YouTube'dan to'liq qo'shiq topilmasa yoki Shazam topa olmagan bo'lsa:
-    # Videoning o'zidan ajratilgan audioni yuboramiz (100% KAFOLATLANGAN!)
+    # 2. Agar YouTube'dan topilmasa va query bir necha so'zdan iborat bo'lsa, qisqartirib yana bir bor qidiramiz
+    if not sent and query and len(query.split()) > 2:
+        short_q = " ".join(query.split()[:2])
+        full_res = await download_full_song_by_query(short_q)
+        if full_res and os.path.exists(full_res.get('filepath', '')):
+            fpath = full_res['filepath']
+            stitle = full_res.get('title', song_title)
+            try:
+                sent_msg = await callback.message.answer_audio(
+                    audio=FSInputFile(fpath),
+                    title=stitle,
+                    caption=f"🎵 <b>{stitle}</b>\n✨ <i>To'liq (original 3-5 daqiqalik) varianti yuklandi!</i>\n✅ @top_media_uz_bot",
+                    parse_mode="HTML"
+                )
+                await status_msg.delete()
+                sent = True
+            finally:
+                remove_file(fpath)
+
+    # 3. Agar to'liq varianti umuman mavjud bo'lmasa (masalan faqat videodagi odamning o'z ovozi bo'lsa),
+    # shundagina videodagi qisqa audioni beramiz
     if not sent:
         if direct_audio and os.path.exists(direct_audio):
-            stitle = song_title[:60] if song_title else "Videodagi musiqa"
-            await callback.message.answer_audio(
-                audio=FSInputFile(direct_audio),
-                title=stitle,
-                caption=f"🎵 <b>{stitle}</b>\n✨ <i>Videodagi audio yuklandi!</i>\n✅ @top_media_uz_bot",
-                parse_mode="HTML"
-            )
-            await status_msg.delete()
-            sent = True
+            try:
+                await callback.message.answer_audio(
+                    audio=FSInputFile(direct_audio),
+                    title=song_title[:60],
+                    caption=f"🎵 <b>{song_title[:60]}</b>\n⚠️ <i>Ushbu musiqaning to'liq varianti topilmadi, videodagi audio yuklandi.</i>\n✅ @top_media_uz_bot",
+                    parse_mode="HTML"
+                )
+                await status_msg.delete()
+                sent = True
+            finally:
+                remove_file(direct_audio)
         elif url:
             direct_dl = await download_direct_audio_from_url(url)
             if direct_dl and os.path.exists(direct_dl):
                 try:
-                    stitle = song_title[:60] if song_title else "Videodagi musiqa"
                     await callback.message.answer_audio(
                         audio=FSInputFile(direct_dl),
-                        title=stitle,
-                        caption=f"🎵 <b>{stitle}</b>\n✨ <i>Videodagi audio yuklandi!</i>\n✅ @top_media_uz_bot",
+                        title=song_title[:60],
+                        caption=f"🎵 <b>{song_title[:60]}</b>\n⚠️ <i>Ushbu musiqaning to'liq varianti topilmadi, videodagi audio yuklandi.</i>\n✅ @top_media_uz_bot",
                         parse_mode="HTML"
                     )
                     await status_msg.delete()
