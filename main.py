@@ -215,11 +215,8 @@ def _get_fast_opts() -> dict:
         'geo_bypass': True,
         'ignoreerrors': False,
         'concurrent_fragment_downloads': 10,
-        'buffersize': 1024 * 1024 * 16,
-        'http_chunk_size': 10485760,
         'socket_timeout': 15,
         'retries': 3,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web'], 'skip': ['translated_subs']}},
         'headers': {'User-Agent': 'Mozilla/5.0'}
     }
     if FFMPEG_EXE and os.path.exists(FFMPEG_EXE):
