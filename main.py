@@ -646,6 +646,32 @@ async def handle_url_message(message: types.Message, bot: Bot):
     finally:
         remove_file(filepath)
 
+    # Foydalanuvchi kutib o'tirmasligi uchun TO'LIQ (4-5 daqiqalik) MP3 musiqani avtomatik yuboramiz!
+    if search_query:
+        audio_status = await message.answer(f"🎵 <i>'{song_title}' — to'liq (4-5 daqiqalik) musiqa tayyorlanmoqda...</i>", parse_mode="HTML")
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VOICE)
+
+        full_res = await download_full_song_by_query(search_query)
+        if full_res and os.path.exists(full_res.get('filepath', '')):
+            fpath = full_res['filepath']
+            stitle = full_res.get('title', song_title)
+            try:
+                sent_audio = await message.answer_audio(
+                    audio=FSInputFile(fpath),
+                    title=stitle,
+                    performer=artist if artist else "Top Media",
+                    caption=f"🎵 <b>{stitle}</b>\n✨ <i>To'liq (original 4-5 daqiqalik) variant!</i>\n✅ @top_media_uz_bot",
+                    parse_mode="HTML"
+                )
+                if sent_audio.audio:
+                    audio_file_cache[search_query.strip().lower()] = sent_audio.audio.file_id
+                await audio_status.delete()
+                return
+            finally:
+                remove_file(fpath)
+        else:
+            await audio_status.delete()
+
 # Video fayldan to'g'ridan-to'g'ri musiqa aniqlash (Telegramga tashlangan video yoki dumaloq video-xabarlar)
 @dp.message(F.video | F.video_note)
 async def handle_video_file_recognition(message: types.Message, bot: Bot):
@@ -666,25 +692,42 @@ async def handle_video_file_recognition(message: types.Message, bot: Bot):
         if track and track.get('title'):
             song_title = track['title']
             artist = track.get('subtitle', '')
-            media_id = uuid.uuid4().hex[:10]
-            media_store[media_id] = {
-                'query': f"{song_title} {artist}",
-                'title': song_title,
-                'is_shazam': True,
-                'direct_audio': direct_audio_path,
-            }
+            search_query = f"{song_title} {artist}".strip()
 
-            markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎵 To'liq MP3 qo'shiqni yuklab olish", callback_data=f"get_m_{media_id}")]
-            ])
-
-            caption = (
+            await status_msg.edit_text(
                 f"🎉 <b>Musiqa topildi!</b>\n\n"
                 f"🎵 <b>Nomi:</b> {song_title}\n"
                 f"👤 <b>Ijrochi:</b> {artist}\n\n"
-                f"<i>To'liq (original 3-5 daqiqalik) musiqani yuklab olish uchun pastdagi tugmani bosing 👇</i>"
+                f"⏳ <i>To'liq (4-5 daqiqalik) original musiqa yuklanmoqda...</i>",
+                parse_mode="HTML"
             )
-            await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=markup)
+
+            full_res = await download_full_song_by_query(search_query)
+            if full_res and os.path.exists(full_res.get('filepath', '')):
+                fpath = full_res['filepath']
+                stitle = full_res.get('title', song_title)
+                try:
+                    await message.reply_audio(
+                        audio=FSInputFile(fpath),
+                        title=stitle,
+                        performer=artist if artist else "Top Media",
+                        caption=f"🎵 <b>{stitle}</b>\n✨ <i>To'liq (original 4-5 daqiqalik) varianti yuklandi!</i>\n✅ @top_media_uz_bot",
+                        parse_mode="HTML"
+                    )
+                    await status_msg.delete()
+                    return
+                finally:
+                    remove_file(fpath)
+            elif direct_audio_path and os.path.exists(direct_audio_path):
+                await message.reply_audio(
+                    audio=FSInputFile(direct_audio_path),
+                    title=song_title,
+                    performer=artist,
+                    caption=f"🎵 <b>{song_title}</b>\n✅ @top_media_uz_bot",
+                    parse_mode="HTML"
+                )
+                await status_msg.delete()
+                return
         elif direct_audio_path and os.path.exists(direct_audio_path):
             await message.reply_audio(
                 audio=FSInputFile(direct_audio_path),
