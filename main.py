@@ -593,20 +593,19 @@ async def handle_url_message(message: types.Message, bot: Bot):
     artist = ""
     is_shazam = False
 
-    # 1. Instagram / TikTok metama'lumotlaridan tekshirish
-    meta_track = res.get('track')
-    meta_artist = res.get('artist')
-    if meta_track and len(meta_track.strip()) > 1:
-        song_title = meta_track.strip()
-        artist = (meta_artist or "").strip()
+    # 1. SHAZAM orqali haqiqiy akustik tahlil (HAR DOIM 1-O'RINDA!)
+    recognized_song = await recognize_music_from_video(filepath)
+    if recognized_song and recognized_song.get('title'):
+        song_title = recognized_song['title'].strip()
+        artist = (recognized_song.get('subtitle') or "").strip()
         is_shazam = True
 
-    # 2. Agar metama'lumotda bo'lmasa, butun audio WAV orqali Shazam tahlili
+    # 2. Agar Shazam topa olmasa, Instagram / TikTok metama'lumotlaridan tekshirish
     if not is_shazam:
-        recognized_song = await recognize_music_from_video(filepath)
-        if recognized_song and recognized_song.get('title'):
-            song_title = recognized_song['title'].strip()
-            artist = (recognized_song.get('subtitle') or "").strip()
+        meta_track = (res.get('track') or "").strip()
+        if meta_track and not any(bad in meta_track.lower() for bad in ['original audio', 'original sound', 'asl audio', 'original', 'video by', 'audio by']):
+            song_title = meta_track
+            artist = (res.get('artist') or "").strip()
             is_shazam = True
 
     if is_shazam and song_title:
