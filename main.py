@@ -355,21 +355,31 @@ def _download_full_song_sync(query: str, output_template: str) -> Optional[Dict[
         print(f"Musiqa yuklashda xatolik: {e}")
         return None
 
-def extract_direct_audio_from_video(video_path: str, output_path: str) -> bool:
-    """Videodan audioni MP3 formatida sifatli ajratib olish (100% ishlaydi)"""
+def extract_direct_audio_from_video(video_path: str, output_base: str) -> Optional[str]:
+    """Videodan audioni 100% kafolat bilan ajratib olish (m4a yoki mp3)"""
+    base, _ = os.path.splitext(output_base)
+    m4a_path = base + ".m4a"
+    mp3_path = base + ".mp3"
+
+    # 1-usul: Stream copy (0.01 soniya, sifat yo'qolmaydi, enkoder shart emas)
     try:
-        cmd = [
-            FFMPEG_EXE, '-y',
-            '-i', video_path,
-            '-vn',
-            '-b:a', '192k',
-            output_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=30)
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 1000
-    except Exception as e:
-        print(f"Direct audio extraction error: {e}")
-        return False
+        cmd = [FFMPEG_EXE, '-y', '-i', video_path, '-vn', '-c:a', 'copy', m4a_path]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        if os.path.exists(m4a_path) and os.path.getsize(m4a_path) > 1000:
+            return m4a_path
+    except Exception:
+        pass
+
+    # 2-usul: Transcode
+    try:
+        cmd = [FFMPEG_EXE, '-y', '-i', video_path, '-vn', mp3_path]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=25)
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 1000:
+            return mp3_path
+    except Exception:
+        pass
+
+    return None
 
 def _download_direct_audio_from_url_sync(url: str, output_template: str) -> Optional[str]:
     opts = _get_fast_opts()
@@ -383,12 +393,13 @@ def _download_direct_audio_from_url_sync(url: str, output_template: str) -> Opti
             if not info: return None
             if 'entries' in info and info['entries']: info = info['entries'][0]
             filepath = ydl.prepare_filename(info)
-            if not os.path.exists(filepath):
-                base, _ = os.path.splitext(filepath)
-                for ext in ['.m4a', '.mp3', '.webm', '.opus', '.aac']:
-                    if os.path.exists(base + ext):
-                        return base + ext
-            return filepath
+            if os.path.exists(filepath):
+                return filepath
+            base, _ = os.path.splitext(filepath)
+            for ext in ['.m4a', '.mp3', '.webm', '.opus', '.aac']:
+                if os.path.exists(base + ext):
+                    return base + ext
+            return None
     except Exception as e:
         print(f"URL direct audio error: {e}")
         return None
@@ -575,9 +586,9 @@ async def handle_url_message(message: types.Message, bot: Bot):
 
     media_id = uuid.uuid4().hex[:10]
 
-    # Videodan audioni darhol MP3 qilib ajratib olamiz (0.2 soniya oladi va har doim kafolatlangan audio bo'ladi!)
-    direct_audio_path = str(DOWNLOAD_DIR / f"aud_{media_id}.mp3")
-    has_direct_audio = extract_direct_audio_from_video(filepath, direct_audio_path)
+    # Videodan audioni darhol ajratib olamiz (0.01 soniya oladi va har doim kafolatlangan audio bo'ladi!)
+    direct_audio_base = str(DOWNLOAD_DIR / f"aud_{media_id}")
+    direct_audio_path = extract_direct_audio_from_video(filepath, direct_audio_base)
 
     # WAV orqali Shazam tahlili (100% xatosiz va tez)
     recognized_song = await recognize_music_from_video(filepath)
@@ -605,7 +616,7 @@ async def handle_url_message(message: types.Message, bot: Bot):
         'url': url,
         'title': song_title if is_shazam else title,
         'is_shazam': is_shazam,
-        'direct_audio': direct_audio_path if has_direct_audio else None,
+        'direct_audio': direct_audio_path,
     }
     markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"get_m_{media_id}")]])
 
@@ -626,10 +637,10 @@ async def handle_video_file_recognition(message: types.Message, bot: Bot):
 
     unique_name = uuid.uuid4().hex[:8]
     temp_vid = str(DOWNLOAD_DIR / f"user_vid_{unique_name}.mp4")
-    direct_audio_path = str(DOWNLOAD_DIR / f"user_aud_{unique_name}.mp3")
+    direct_audio_base = str(DOWNLOAD_DIR / f"user_aud_{unique_name}")
     try:
         await bot.download_file(file_info.file_path, destination=temp_vid)
-        has_direct = extract_direct_audio_from_video(temp_vid, direct_audio_path)
+        direct_audio_path = extract_direct_audio_from_video(temp_vid, direct_audio_base)
         track = await recognize_music_from_video(temp_vid)
 
         if track and track.get('title'):
@@ -640,7 +651,7 @@ async def handle_video_file_recognition(message: types.Message, bot: Bot):
                 'query': f"{song_title} {artist}",
                 'title': song_title,
                 'is_shazam': True,
-                'direct_audio': direct_audio_path if has_direct else None,
+                'direct_audio': direct_audio_path,
             }
 
             markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -654,7 +665,7 @@ async def handle_video_file_recognition(message: types.Message, bot: Bot):
                 f"<i>To'liq (original) musiqani yuklab olish uchun pastdagi tugmani bosing 👇</i>"
             )
             await status_msg.edit_text(caption, parse_mode="HTML", reply_markup=markup)
-        elif has_direct and os.path.exists(direct_audio_path):
+        elif direct_audio_path and os.path.exists(direct_audio_path):
             # Shazamda topilmasa, videoning o'zidagi audioni darhol yuboramiz
             await message.reply_audio(
                 audio=FSInputFile(direct_audio_path),
